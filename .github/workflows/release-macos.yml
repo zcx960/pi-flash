@@ -16,6 +16,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "创建/更新 GitHub Release 并挂资产（不勾则只出 artifact）"
+        type: boolean
+        default: false
 
 env:
   APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
@@ -27,6 +32,8 @@ env:
 jobs:
   macos:
     runs-on: macos-14 # Apple silicon runner
+    permissions:
+      contents: write # softprops/action-gh-release 建 Release 与挂资产需要
     defaults:
       run:
         shell: bash
@@ -245,9 +252,12 @@ jobs:
         id: assets
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            ZIP="pi-flash-${GITHUB_REF_NAME#v}-darwin-arm64.zip"
-            DMG="pi-flash-${GITHUB_REF_NAME#v}-darwin-arm64.dmg"
+          VERSION="${{ steps.ver.outputs.version }}"
+          # 需要发 Release 的场合（tag 推送，或手动触发勾了 publish_release）
+          # 资产名带版本号；否则只是 CI 产物，用中性名。
+          if [[ "$GITHUB_REF" == refs/tags/v* ]] || [ "${{ inputs.publish_release }}" = "true" ]; then
+            ZIP="pi-flash-${VERSION}-darwin-arm64.zip"
+            DMG="pi-flash-${VERSION}-darwin-arm64.dmg"
             mv pi-flash-macos-arm64.zip "$ZIP"
             mv pi-flash-macos-arm64.dmg "$DMG"
           else
@@ -260,6 +270,7 @@ jobs:
           {
             echo "zip=$ZIP"
             echo "dmg=$DMG"
+            echo "tag=v${VERSION}"
           } >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
@@ -272,9 +283,14 @@ jobs:
             ${{ steps.assets.outputs.dmg }}.sha256
 
       - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_release
         uses: softprops/action-gh-release@v2
         with:
+          # tag 推送时就是当前 tag；手动触发时用 Cargo.toml 的版本拼 v<version>，
+          # tag 不存在就由本 action 创建。
+          tag_name: ${{ steps.assets.outputs.tag }}
+          name: pi-flash ${{ steps.assets.outputs.tag }} (macOS arm64)
+          generate_release_notes: true
           files: |
             ${{ steps.assets.outputs.zip }}
             ${{ steps.assets.outputs.dmg }}
