@@ -1,15 +1,20 @@
 # macOS build bundle (pi-flash-650): build the .app with the vendored pi,
 # sign + notarize when Apple secrets are configured, ad-hoc sign otherwise.
 # Windows stays a local-development build (see AGENTS.md) and is not built here.
+#
+# 产物（darwin-arm64）：
+#   pi-flash-<v>-darwin-arm64.dmg   安装包（拖进 Applications）
+#   pi-flash-<v>-darwin-arm64.zip   给 npm 薄壳用的载荷（薄壳按这个文件名解析）
+#   <资产>.sha256                   各自校验和
+#
+# 触发：推 v* tag（自动挂 Release）或手动 workflow_dispatch（只出 artifact）。
+# 去掉了 push:main / pull_request —— 单次全量构建 20~30 分钟，日常提交不值当。
 
 name: release-macos
 
 on:
   push:
-    branches: [main]
     tags: ["v*"]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
 env:
@@ -37,6 +42,21 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+
+      # 版本号：tag 时取 tag（v0.2.0 -> 0.2.0），手动触发时退回 Cargo.toml。
+      # 原实现直接拿 ${GITHUB_REF_NAME#v}，手动触发会得到分支名 "main"，
+      # 变成 dmg 里 CFBundleShortVersionString = main。
+      - name: Resolve version
+        id: ver
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            V="${GITHUB_REF_NAME#v}"
+          else
+            V=$(grep -m1 '^version' crates/app/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "resolved version: $V (ref: $GITHUB_REF)"
 
       # vendored pi: node_modules is not committed (AGENTS.md 铁律)
       - name: Install vendored pi dependencies
@@ -73,6 +93,8 @@ jobs:
         run: |
           set -euo pipefail
           APP=pi-flash.app
+          VERSION="${{ steps.ver.outputs.version }}"
+          rm -rf "$APP"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp target/release/pi-flash "$APP/Contents/MacOS/pi-flash"
           # node 与 vendor 必须放 Contents/Resources：Contents/MacOS 只允许主
@@ -95,7 +117,7 @@ jobs:
             <key>CFBundleExecutable</key><string>pi-flash</string>
             <key>CFBundleIconFile</key><string>pi-flash</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>${GITHUB_REF_NAME#v}</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
             <key>CFBundleVersion</key><string>${GITHUB_SHA::8}</string>
             <key>LSMinimumSystemVersion</key><string>13.0</string>
             <key>NSHighResolutionCapable</key><true/>
@@ -112,7 +134,6 @@ jobs:
             esac
           done < <(find "$APP" -type f \( -perm -u+x -o -name '*.node' -o -name '*.dylib' \) -print0)
           codesign --force --sign - "$APP"
-          zip -qry pi-flash-macos-arm64.zip "$APP"
 
       # real signing/notarization only when the repo has the secrets
       - name: Import signing identity
@@ -139,43 +160,111 @@ jobs:
           done < <(find pi-flash.app -type f \( -perm -u+x -o -name '*.node' -o -name '*.dylib' \) -print0)
           codesign --force --options runtime --timestamp --sign "$IDENTITY" pi-flash.app
 
-      - name: Notarize + staple
+      # 公证在「打包 dmg 之前」做：公证的对象是 app 本身，staple 会改写 app 内部，
+      # 所以必须先 staple 再 zip/dmg，否则分发包里的票据跟签名对不上。
+      - name: Notarize + staple (Developer ID only)
         if: ${{ env.APPLE_CERTIFICATE_P12 != '' && env.APPLE_ID != '' }}
         run: |
-          zip -qry pi-flash-macos-arm64.zip pi-flash.app
-          xcrun notarytool submit pi-flash-macos-arm64.zip \
+          ditto -c -k --keepParent pi-flash.app notarize-upload.zip
+          xcrun notarytool submit notarize-upload.zip \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
             --wait
           xcrun stapler staple pi-flash.app
-          rm pi-flash-macos-arm64.zip
-          zip -qry pi-flash-macos-arm64.zip pi-flash.app
+          rm notarize-upload.zip
+          spctl --assess --type execute -vv pi-flash.app || true
+
+      # 薄壳要的 zip：ditto 打包，保留符号链接/xattr/签名（zip(1) 会把
+      # Frameworks 里的符号链接拍平成副本，ditto 不会，这是 Apple 的推荐姿势）
+      - name: Package ZIP (npm shell payload)
+        run: |
+          set -euo pipefail
+          rm -f pi-flash-macos-arm64.zip
+          ditto -c -k --keepParent pi-flash.app pi-flash-macos-arm64.zip
+
+      - name: Build DMG
+        run: |
+          set -euo pipefail
+          APP=pi-flash.app
+          STAGE="$(mktemp -d)/dmg"
+          mkdir -p "$STAGE"
+          # ditto 而不是 cp -R：保留签名所需的 xattr/ACL/resource fork
+          ditto "$APP" "$STAGE/$APP"
+          # 拖拽安装用的 Applications 快捷方式
+          ln -s /Applications "$STAGE/Applications"
+          # 无开发者证书时（ad-hoc 签名）首次打开会被 Gatekeeper 拦，
+          # 这张说明是给使用者看的唯一提示，别删。
+          cat > "$STAGE/首次打开请看这里.txt" <<'NOTE'
+          pi-flash 是 ad-hoc 签名（无 Apple 开发者证书）的构建，首次打开会被 Gatekeeper 拦下。
+
+          正确姿势（二选一）：
+            1) 拖到 Applications 后，右键点 pi-flash → 打开 → 弹窗里再点「打开」
+            2) 终端执行：xattr -dr com.apple.quarantine /Applications/pi-flash.app
+
+          之后就能正常双击启动了。
+          NOTE
+          # UDZO = zlib 压缩，兼容性最好；UDBZ(bzip2) 更小但慢。
+          # 卷名不带版本号：带空格会让挂载路径变成 "/Volumes/pi-flash 0.2.0"，
+          # 后续脚本很容易在没加引号的地方炸。版本体现在 dmg 文件名和 Info.plist。
+          rm -f pi-flash-macos-arm64.dmg
+          hdiutil create \
+            -volname "pi-flash" \
+            -srcfolder "$STAGE" \
+            -fs HFS+ \
+            -format UDZO \
+            -ov \
+            pi-flash-macos-arm64.dmg
+          rm -rf "$(dirname "$STAGE")"
+          # 挂载验一遍：能挂上、app 在、签名没坏。用 -mountpoint 固定挂载点，
+          # 不解析 hdiutil 输出（卷名里带空格/中文时解析必踩坑）。
+          MNT="$(mktemp -d)/mnt"
+          mkdir -p "$MNT"
+          hdiutil attach pi-flash-macos-arm64.dmg -nobrowse -readonly -mountpoint "$MNT"
+          test -d "$MNT/$APP" || { echo "app missing in dmg"; exit 1; }
+          test -L "$MNT/Applications" || { echo "Applications symlink missing"; exit 1; }
+          codesign --verify --deep --verbose=1 "$MNT/$APP" || { echo "codesign verify failed in dmg"; exit 1; }
+          hdiutil detach "$MNT" -quiet
+          ls -lh pi-flash-macos-arm64.dmg
 
       # 资产名带版本与平台（npm 薄壳按 pi-flash-<ver>-darwin-arm64.zip 解析，
       # 080 §4）+ sidecar 校验和（薄壳下载时比对；SHA256SUMS 归 release.sh 不碰）
       - name: Name release assets + checksum
         id: assets
         run: |
+          set -euo pipefail
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            NAME="pi-flash-${GITHUB_REF_NAME#v}-darwin-arm64.zip"
-            mv pi-flash-macos-arm64.zip "$NAME"
+            ZIP="pi-flash-${GITHUB_REF_NAME#v}-darwin-arm64.zip"
+            DMG="pi-flash-${GITHUB_REF_NAME#v}-darwin-arm64.dmg"
+            mv pi-flash-macos-arm64.zip "$ZIP"
+            mv pi-flash-macos-arm64.dmg "$DMG"
           else
-            NAME="pi-flash-macos-arm64.zip"
+            ZIP="pi-flash-macos-arm64.zip"
+            DMG="pi-flash-macos-arm64.dmg"
           fi
-          shasum -a 256 "$NAME" > "$NAME.sha256"
-          cat "$NAME.sha256"
-          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          shasum -a 256 "$ZIP" > "$ZIP.sha256"
+          shasum -a 256 "$DMG" > "$DMG.sha256"
+          cat "$ZIP.sha256" "$DMG.sha256"
+          {
+            echo "zip=$ZIP"
+            echo "dmg=$DMG"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
           name: pi-flash-macos-arm64
-          path: ${{ steps.assets.outputs.name }}
+          path: |
+            ${{ steps.assets.outputs.zip }}
+            ${{ steps.assets.outputs.dmg }}
+            ${{ steps.assets.outputs.zip }}.sha256
+            ${{ steps.assets.outputs.dmg }}.sha256
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            ${{ steps.assets.outputs.name }}
-            ${{ steps.assets.outputs.name }}.sha256
+            ${{ steps.assets.outputs.zip }}
+            ${{ steps.assets.outputs.dmg }}
+            ${{ steps.assets.outputs.zip }}.sha256
+            ${{ steps.assets.outputs.dmg }}.sha256
