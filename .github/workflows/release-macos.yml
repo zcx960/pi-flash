@@ -63,12 +63,21 @@ jobs:
         run: npm ci
         working-directory: vendor/pi
 
-      # vendor/pi 的 @esbuild 带 26 个平台二进制（≈284MB），包内只留宿主
-      # darwin-arm64（080-软件分发 §4；release.sh 对 Windows 包同理留 win32-x64）
+      # vendor/pi 早期版本用 esbuild 打包 @esbuild 的 26 个平台二进制（≈284MB），
+      # 包内只留宿主 darwin-arm64。pi 1.3.0 起依赖树里已无 esbuild，
+      # 这里改成「有就裁、没有就跳过」，不再让构建硬失败。
       - name: Prune non-host esbuild binaries
         run: |
           ESD="vendor/pi/node_modules/@earendil-works/pi-coding-agent/node_modules/@esbuild"
-          [ -d "$ESD/darwin-arm64" ] || { echo "missing @esbuild/darwin-arm64"; exit 1; }
+          if [ ! -d "$ESD" ]; then
+            echo "no @esbuild in this dependency tree — nothing to prune"
+            exit 0
+          fi
+          if [ ! -d "$ESD/darwin-arm64" ]; then
+            echo "::error::@esbuild present but darwin-arm64 missing"
+            ls "$ESD"
+            exit 1
+          fi
           for d in "$ESD"/*; do
             [ "$(basename "$d")" = "darwin-arm64" ] || rm -rf "$d"
           done
@@ -104,8 +113,11 @@ jobs:
           cp node "$APP/Contents/Resources/node"
           # brand icon (Big Sur grid master -> .icns)
           cp crates/app/assets/macos/pi-flash.icns "$APP/Contents/Resources/pi-flash.icns"
-          # release layout: vendor/pi lives in Contents/Resources
-          cp -R vendor "$APP/Contents/Resources/vendor"
+          # release layout: 运行时按 <exe>/../Resources/vendor/pi 解析（pi_link::vendor）
+          # 只拷 vendor/pi —— vendor/ 下还有 gpui / gpui-component 的 Rust 源码，
+          # 那是编译期 patch 源，塞进 app 纯浪费体积。
+          mkdir -p "$APP/Contents/Resources/vendor"
+          ditto vendor/pi "$APP/Contents/Resources/vendor/pi"
           cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
