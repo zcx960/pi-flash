@@ -18,13 +18,17 @@
 
 ## 1. 产物与通道
 
-  **平台范围：只发 Windows x64。不发布 macOS 版本**
-`release-macos.yml` 已 `disabled_manually`，不做 darwin 资产，npm 薄壳在 macOS 上会报「暂无发布资产」。
+  **平台范围：Windows x64（上游产物）+ macOS arm64（本 fork 新增）**
+
+Windows 仍走本地 `scripts/release.sh`。macOS 改由 `.github/workflows/release-macos.yml`
+在 CI 构建（macos-14 runner），出 dmg + zip。npm 薄壳的下载源硬编码指向上游
+`danielbill/pi-flash`，与本 fork 的 Release 无关。
 
 | 产物 | 通道 | 产生方式 | 备注 |
 |---|---|---|---|
-| `pi-flash-<v>-win32-x64.zip` + `.sha256` + `SHA256SUMS` | GitHub Release | 本地 `scripts/release.sh` | ≈86MB；解压 299MB（esbuild 已裁非宿主平台） |
-| ~~`pi-flash-<v>-darwin-arm64.zip`~~ | — | **不发布** | macOS 不在支持范围；薄壳代码仍保留 darwin 分支，只是不出资产 |
+| `pi-flash-<v>-win32-x64.zip` + `.sha256` + `SHA256SUMS` | GitHub Release | 本地 `scripts/release.sh` | ≈86MB；解压 299MB |
+| `pi-flash-<v>-darwin-arm64.dmg` + `.sha256` | GitHub Release | CI `release-macos.yml` | ≈95MB；未配 Apple 证书时 ad-hoc 签名，用户首次打开需右键放行 |
+| `pi-flash-<v>-darwin-arm64.zip` + `.sha256` | GitHub Release | CI `release-macos.yml` | ≈85MB；npm 薄壳 / 脚本取用 |
 | `pi-flash` npm 薄壳（7.4kB，仅 bin/） | npm 官方源 | **首发手动一次（0.1.0 已完成）→ 此后 `publish-npm.yml` OIDC 自动** | 薄壳安装时从 Release 拉载荷并 SHA-256 校验 |
 | `docs/CHANGELOG.md` + `docs/CHANGELOG_EN.md` 新版本段 | 仓库 | release.sh 5/8：说明文件中文段收编中文版、`<!-- EN -->` 后英文段收编英文版 | 说明文件全文（双语）作 GitHub Release 正文，同一 tag 下中英同页 |
 | provenance 签名 | npm 包页 | OIDC 发布自动生成 | 供应链徽章，免配置 |
@@ -92,7 +96,9 @@ cd npm && npm publish                             # ③ 仅首发/回退需要�
 ```
 
 - **commit 必须带 pathspec**（如上）：工作区可能有并行会话 staged 的内容，裸 `git commit` 会把它卷进发版提交
-- **不发布 macOS**（§1 定夺）：`release-macos` workflow 已停用，不会自建 release，①→② 无需抢时间
+- macOS 资产走另一条链：`release-macos` workflow（tag 推送，或手动 dispatch 勾 `publish_release`）
+  会按 `crates/app/Cargo.toml` 的版本建/更新 Release 并挂 dmg + zip。两条链共用同一 tag 的
+  Release（先到先建、后到追加资产），互不覆盖
 - 尾部块内的 `npm publish` 与 CI 的 `publish-npm.yml` **二选一**，勿双跑（重复发版报 EPUBLISHCONFLICT，job 红）
 - tag 已存在且指向旧提交（测试期残留）时：发版前 `git tag -f v<v>` + 强制推 tag。`gh release create --verify-tag` 只校核tag 存在，不校核指向哪个 commit
 
@@ -127,7 +133,9 @@ tag 推送后 `publish-npm.yml` 自动 OIDC 发薄壳（分钟级），无需干
       `cargo build && scripts/upd-e2e.sh`
       （081 §7 的夹具：真 release zip + 本地假 API/镜像，隔离目录 + pif-ui 驱动，
       不碰真实安装、不改版本号；github 直连/镜像与 release 构建需有网环境另验）
-- [ ] macOS：不在支持范围，**无 darwin 资产可验**
+- [ ] macOS：`gh release view v<v>` 里 dmg + zip + 两个 `.sha256` 齐全；真机装好启动后
+      `lsappinfo list | grep -i pi-flash` 能看到 `type="Foreground"`（比截图可靠，沙箱里截不了屏）
+      —— 未配证书的构建 `spctl --assess` 报 `rejected` 属预期，不是失败
 - [ ] 通知测试者；镜像站（npmmirror）同步有延迟，**首装带 `--registry` 官方源**
 
 ## 6. 异常处置
